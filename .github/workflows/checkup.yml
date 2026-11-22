@@ -1,0 +1,86 @@
+name: 13주차 사전과제 자동 점검 (Link & PR Checkup)
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: '점검할 PR 번호'
+        required: true
+        default: '1'
+
+permissions:
+  pull-requests: write
+  contents: read
+  issues: write
+
+jobs:
+  checkup:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+      # pull_request_target에서는 원본(main)의 스크립트만 checkout합니다.
+      # 학생 PR의 코드는 checkout·실행하지 않고, 제출 파일 내용만 API로 읽습니다.
+      - name: 저장소 체크아웃 (원본 스크립트 로드용)
+        uses: actions/checkout@v4
+
+      - name: 링크 및 PR 자동 점검
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.pull_request.number }}
+        run: |
+          echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
+          node .github/scripts/checkup.cjs
+
+      - name: PR 코멘트 및 라벨 처리
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "통과" --color "0e8a16" --description "점검 통과" 2>/dev/null || true
+          gh label create "보완 필요" --color "d93f0b" --description "보완 후 재제출 필요" 2>/dev/null || true
+
+          gh pr comment "$PR_NUMBER" --body-file result_comment.txt
+
+          STATUS=$(cat status.txt 2>/dev/null || echo "RETRY")
+          if [ "$STATUS" = "PASS" ]; then
+            gh pr edit "$PR_NUMBER" --remove-label "보완 필요" 2>/dev/null || true
+            gh pr edit "$PR_NUMBER" --add-label "통과"
+            gh pr close "$PR_NUMBER" --comment "🎉 모든 링크와 PR이 확인되어 사전과제 접수를 마감합니다. 13주차 수업에서 만나요!"
+          else
+            gh pr edit "$PR_NUMBER" --remove-label "통과" 2>/dev/null || true
+            gh pr edit "$PR_NUMBER" --add-label "보완 필요"
+          fi
+
+      - name: Slack 채널 알림 발송
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL이 설정되어 있지 않아 알림을 건너뜁니다."
+            exit 0
+          fi
+
+          SUMMARY=$(cat summary.txt 2>/dev/null || echo "점검 완료")
+          STATUS=$(cat status.txt 2>/dev/null || echo "RETRY")
+          COLOR=$([ "$STATUS" = "PASS" ] && echo "#36a64f" || echo "#e01e5a")
+          ICON=$([ "$STATUS" = "PASS" ] && echo "✅" || echo "⚠️")
+
+          PAYLOAD=$(jq -nc \
+            --arg author "$PR_AUTHOR" \
+            --arg url "$PR_URL" \
+            --arg summary "$SUMMARY" \
+            --arg icon "$ICON" \
+            --arg color "$COLOR" \
+            '{
+              attachments: [{
+                color: $color,
+                title: "\($icon) [13주차 사전과제 점검] \($author) (\($summary))",
+                title_link: $url,
+                text: "PR: <\($url)>\n판정: \($summary)",
+                ts: (now | floor)
+              }]
+            }')
+
+          curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
